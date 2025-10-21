@@ -211,6 +211,31 @@ int main(int argc, char* argv[])
     sqd_data.comm = MPI_COMM_WORLD;
     MPI_Comm_rank(sqd_data.comm, &sqd_data.mpi_rank);
     MPI_Comm_size(sqd_data.comm, &sqd_data.mpi_size);
+
+    //create sub-communicators for ranks on same node
+    MPI_Comm node_comm;
+    MPI_Comm_split_type(sqd_data.comm, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL, &node_comm);
+    int local_rank;
+    MPI_Comm_rank(node_comm, &local_rank);
+
+    // create a communicator for rank 0 on each node
+    int is_node_leader = (local_rank == 0);
+    MPI_Comm leaders_comm;
+    MPI_Comm_split(MPI_COMM_WORLD, is_node_leader ? 0 : MPI_UNDEFINED, sqd_data.mpi_rank, &leaders_comm);
+
+    // Get number of nodes from size of leaders_comm
+    int num_nodes = 0;
+    if (is_node_leader) {
+        MPI_Comm_size(leaders_comm, &num_nodes);
+    }
+
+    // Broadcast num_nodes to everyone
+    MPI_Bcast(&num_nodes, 1, MPI_INT, 0, MPI_COMM_WORLD);
+
+    std::cout << "Rank " << sqd_data.mpi_rank << " / " << sqd_data.mpi_size
+              << " is on node rank " << local_rank
+              << ", total nodes = " << num_nodes << std::endl;
+
     //std::cout<<"MPI rank/size: " << sqd_data.mpi_rank << "/" << sqd_data.mpi_size << std::endl;
     int message_size = sqd_data.run_id.size();
     // Send the integer message_size from rank 0 to all others.
@@ -261,7 +286,6 @@ int main(int argc, char* argv[])
         log(sqd_data,
             {"initial parameters are loaded. param_length=", std::to_string(init_params.size())});
     }
-    int node_per_member = sqd_data.mpi_size;
 
     // Measurement results: (bitstring -> counts). Produced on rank 0, then array-ified
     // later.
@@ -269,6 +293,9 @@ int main(int argc, char* argv[])
 
     auto num_elec_a = nelec.first;
     auto num_elec_b = nelec.second;
+    // Broadcast num_elec to all ranks
+    MPI_Bcast(&num_elec_a, 1, MPI_UINT64_T, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&num_elec_b, 1, MPI_UINT64_T, 0, MPI_COMM_WORLD);
     if (sqd_data.mpi_rank == 0)
     {
 // ===== Sampling mode switch =====
@@ -276,6 +303,7 @@ int main(int argc, char* argv[])
 // b) Real: build LUCJ circuit -> transpile -> run on backend with Sampler -> get counts
 #if USE_RANDOM_SHOTS != 0
         counts = generate_counts_uniform(sqd_data.num_shots, 2 * norb, 1234);
+        // counts is a key:value map (bitstring -> occurrences) e.g. {"0101", 23}
 #else
         //////////////// LUCJ Circuit Generation ////////////////
         size_t params_size = init_params.size();
@@ -375,6 +403,47 @@ int main(int argc, char* argv[])
 
     ////// Configuration Recovery, Post Selection, Diagonalization //////
 
+    // Broadcast counts from rank 0 to all other ranks.
+    // save number of elements in counts and bitstring length
+    int n_counts = counts.size();
+    int bitstring_length = 2 * norb; // length of each bitstring (same for all)
+    // Broadcast counts info to all ranks
+    MPI_Bcast(&n_counts, 1, MPI_INT, 0, sqd_data.comm);
+    MPI_Bcast(&bitstring_length, 1, MPI_INT, 0, sqd_data.comm);
+    int total_chars = n_counts * bitstring_length;
+
+    // First flatten keys and values on rank 0
+    std::vector<char> flat_keys;
+    std::vector<uint64_t> flat_values;
+    if (sqd_data.mpi_rank == 0) {
+        flat_keys.reserve(n_counts * bitstring_length);
+        flat_values.reserve(n_counts);
+    
+        for (const auto& [key, val] : counts) {
+            flat_keys.insert(flat_keys.end(), key.begin(), key.end());
+            flat_values.push_back(val);
+        }
+    }
+    // Resize buffers on non-root ranks
+    if (sqd_data.mpi_rank != 0) {
+        flat_keys.resize(total_chars);
+        flat_values.resize(n_counts);
+    }
+    MPI_Bcast(flat_keys.data(), total_chars, MPI_CHAR, 0, sqd_data.comm);
+    MPI_Bcast(flat_values.data(), n_counts, MPI_UINT64_T, 0, sqd_data.comm);
+    
+    // On non-root ranks, reconstruct
+    if (sqd_data.mpi_rank != 0) {
+        counts.clear();
+        int offset = 0;
+        for (int i = 0; i < n_counts; ++i) {
+            std::string key(flat_keys.data() + offset, bitstring_length);
+            uint64_t val = flat_values[i];
+            counts.emplace(key, val);
+            offset += bitstring_length;
+        }
+    }
+
     // Expand counts (map) into (bitstrings[], probs[]).
     auto [bitstring_matrix_full_, probs_arr_full] = counts_to_arrays(counts);
     auto bitstring_matrix_full = bitsets_from_bitstrings(bitstring_matrix_full_);
@@ -415,37 +484,104 @@ int main(int argc, char* argv[])
             latest_occupancies = initial_occupancies;
         }
 
-        // ===== BATCHES SPLIT ACROSS MPI RANKS =====
-        // new declaration (Flavia): each rank has its own batches
-        // n_rank_batches[i] = number of batches assigned to rank i
-        // each batch initially recieves N_batches/N_ranks batches
-        std::vector<int> n_rank_batches(sqd_data.mpi_size, n_batches / sqd_data.mpi_size);
-        // then, the reminder of N_batches/N_ranks is assigned to the first ranks
-        for (int r = 0; r < n_batches % sqd_data.mpi_size; ++r) 
-        {
-            n_rank_batches[r] += 1; 
-        }
-        log(sqd_data, {"Rank ", std::to_string(sqd_data.mpi_rank), 
-                       " processes ", std::to_string(n_rank_batches[sqd_data.mpi_rank]), " batches."});
-        
-        // initialize vector of batches (size: n_rank_batches[rank] each batch is a vector of dynamic_bitset) 
-        std::vector<std::vector<boost::dynamic_bitset<>>> batches(n_rank_batches[sqd_data.mpi_rank]);
-
         // ===== BITSTRINGS & PROBABILITIES FOR SAMPLING =====
+        // vectors for postselected bitstrings and probabilities
+        //std::vector<double> postselected_probs;
+        //std::vector<boost::dynamic_bitset<>> postselected_bitstrings;
+
+        // RECOVERY & POST-SELECTION of BITSTRINGS and PROBABILITIES
+
+        // Recover physically consistent configurations from observed probabilities + prior occupancies.
+        // Split across MPI ranks for scalability.
+        size_t N = bitstring_matrix_full.size();
+        size_t chunk = N / sqd_data.mpi_size;
+        size_t remainder = N % sqd_data.mpi_size;
+        // each rank gets a chunk, ranks whose ID is lower than remainder get an extra item
+        size_t start = sqd_data.mpi_rank * chunk + std::min<size_t>(sqd_data.mpi_rank, remainder);
+        size_t end   = start + chunk + (sqd_data.mpi_rank < remainder ? 1 : 0);
+
+        std::vector<boost::dynamic_bitset<>> local_bitstrings(bitstring_matrix_full.begin() + start, bitstring_matrix_full.begin() + end);
+        std::vector<double> local_probs(probs_arr_full.begin() + start, probs_arr_full.begin() + end);
+
+        auto recovered = Qiskit::addon::sqd::recover_configurations(
+            local_bitstrings, local_probs, latest_occupancies, {num_elec_a, num_elec_b},
+            rc_rng);
+        bs_mat_tmp = std::move(recovered.first);
+        probs_arr_tmp = std::move(recovered.second);
+
+        // Post-selection: accept bitstrings whose left/right (alpha/beta) Hamming
+        // weights match target electron counts.
+        auto result =
+            Qiskit::addon::sqd::postselect_bitstrings(
+                bs_mat_tmp, probs_arr_tmp,
+                Qiskit::addon::sqd::MatchesRightLeftHamming(num_elec_a, num_elec_b));
+            
+        auto &local_postselected_bitstrings = result.first;
+        auto &local_postselected_probs      = result.second;
+        int local_N = local_postselected_bitstrings.size();
+
+        std::vector<char> local_flat_keys(local_N * bitstring_length);
+        for (int i = 0; i < local_N; ++i)
+        {
+            std::string s;
+            boost::to_string(local_postselected_bitstrings[i], s);  // convert to "0101..."
+            assert((int)s.size() == bitstring_length);
+            memcpy(&local_flat_keys[i * bitstring_length], s.data(), bitstring_length);
+        }
+
+        std::vector<double> local_flat_probs(local_postselected_probs.begin(), local_postselected_probs.end());
+
+        // Gather sizes from all ranks
+        std::vector<int> recv_counts(sqd_data.mpi_size);
+        MPI_Allgather(&local_N, 1, MPI_INT, recv_counts.data(), 1, MPI_INT, sqd_data.comm);
+
+        std::vector<int> displs(sqd_data.mpi_size, 0);
+        for (int i = 1; i < sqd_data.mpi_size; ++i)
+            displs[i] = displs[i-1] + recv_counts[i-1];
+        int total_count = displs.back() + recv_counts.back();
+
+        std::vector<char> global_flat_keys(total_count * bitstring_length);
+        std::vector<double> global_flat_probs(total_count);
+
+        std::vector<int> recv_counts_keys(sqd_data.mpi_size);
+        std::vector<int> displs_keys(sqd_data.mpi_size);
+        for (int i = 0; i < sqd_data.mpi_size; ++i) 
+        {
+            recv_counts_keys[i] = recv_counts[i] * bitstring_length;
+            displs_keys[i] = displs[i] * bitstring_length;
+        }
+
+        MPI_Allgatherv(local_flat_keys.data(), local_N * bitstring_length, MPI_CHAR,
+                       global_flat_keys.data(), recv_counts_keys.data(),
+                       displs_keys.data(), MPI_CHAR, sqd_data.comm);
+
+        MPI_Allgatherv(local_flat_probs.data(), local_N, MPI_DOUBLE,
+                       global_flat_probs.data(), recv_counts.data(),
+                       displs.data(), MPI_DOUBLE, sqd_data.comm);
+        
+        std::vector<boost::dynamic_bitset<>> postselected_bitstrings(total_count);
+        for (int i = 0; i < total_count; ++i) 
+        {
+            std::string s(&global_flat_keys[i * bitstring_length], bitstring_length);
+            postselected_bitstrings[i] = boost::dynamic_bitset<>(s);
+        }
+
+        std::vector<double> postselected_probs = std::move(global_flat_probs);
+
+
+
+        
+
+        /* OLD VERSION, DOING RECOVERY AND POSTSELECTION ONLY ON RANK 0 THEN BROADCAST
+        // flat version of bitstrings for broadcasting (needed because we cannot broadcast vector<string>)
+        std::vector<char> flat_bitstrings;
         // Initialize vector of post-selected bitstrings in string format (populated in rank 0, then broadcast to all ranks).
         // because we cannot directly broadcast vector<dynamic_bitset>
         std::vector<std::string> postselected_bitstrings_str;
         // number of postselected bitstrings (after recovery + postselection)
         // this is needed for broadcasting to know the amount of data to send/recv
         int n_postselected = 0;
-        int bitstring_length = 2 * norb; // length of each bitstring (same for all)
         
-        // vectors for postselected bitstrings and probabilities (will contain the full set on all ranks after broadcasting)
-        std::vector<double> postselected_probs;
-        std::vector<boost::dynamic_bitset<>> postselected_bitstrings;
-        // flat version of bitstrings for broadcasting (needed because we cannot broadcast vector<string>)
-        std::vector<char> flat_bitstrings;
-
         // RECOVERY & POST-SELECTION of BITSTRINGS and PROBABILITIES
         // (only on rank 0, then broadcast to all ranks)
         if (sqd_data.mpi_rank == 0)
@@ -530,7 +666,23 @@ int main(int argc, char* argv[])
 
             assert(offset == total_chars); // sanity check
         }
+        */ // END OLD VERSION
 
+        // ===== BATCHES SPLIT ACROSS MPI RANKS =====
+        // new declaration (Flavia): each rank has its own batches
+        // n_rank_batches[i] = number of batches assigned to rank i
+        // each batch initially recieves N_batches/N_ranks batches
+        std::vector<int> n_rank_batches(sqd_data.mpi_size, n_batches / sqd_data.mpi_size);
+        // then, the reminder of N_batches/N_ranks is assigned to the first ranks
+        for (int r = 0; r < n_batches % sqd_data.mpi_size; ++r) 
+        {
+            n_rank_batches[r] += 1; 
+        }
+        log(sqd_data, {"Rank ", std::to_string(sqd_data.mpi_rank), 
+                       " processes ", std::to_string(n_rank_batches[sqd_data.mpi_rank]), " batches."});
+        
+        // initialize vector of batches (size: n_rank_batches[rank] each batch is a vector of dynamic_bitset) 
+        std::vector<std::vector<boost::dynamic_bitset<>>> batches(n_rank_batches[sqd_data.mpi_rank]);
         
         // Subsample batches of bitstrings for SBD input.
         // Each rank populates its own batches vector of size n_rank_batches[rank]
@@ -574,7 +726,7 @@ int main(int argc, char* argv[])
         // int local_n_batches = local_energies.size();
         // recvcounts[i] = number of batches from rank i
         // displs[i] = displacement (offset) in the final array where rank i's data starts
-        std::vector<int> recvcounts, displs;
+        std::vector<int> recvcounts;
         std::vector<double> all_energies;
 
         if (sqd_data.mpi_rank == 0) 
