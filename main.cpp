@@ -220,8 +220,12 @@ int main(int argc, char* argv[])
 
     // create a communicator for rank 0 on each node
     int is_node_leader = (local_rank == 0);
+    int leaders_rank = -1;
     MPI_Comm leaders_comm;
     MPI_Comm_split(MPI_COMM_WORLD, is_node_leader ? 0 : MPI_UNDEFINED, sqd_data.mpi_rank, &leaders_comm);
+    if (is_node_leader) {
+        MPI_Comm_rank(leaders_comm, &leaders_rank);
+    }
 
     // Get number of nodes from size of leaders_comm
     int num_nodes = 0;
@@ -568,10 +572,6 @@ int main(int argc, char* argv[])
 
         std::vector<double> postselected_probs = std::move(global_flat_probs);
 
-
-
-        
-
         /* OLD VERSION, DOING RECOVERY AND POSTSELECTION ONLY ON RANK 0 THEN BROADCAST
         // flat version of bitstrings for broadcasting (needed because we cannot broadcast vector<string>)
         std::vector<char> flat_bitstrings;
@@ -668,26 +668,36 @@ int main(int argc, char* argv[])
         }
         */ // END OLD VERSION
 
-        // ===== BATCHES SPLIT ACROSS MPI RANKS =====
-        // new declaration (Flavia): each rank has its own batches
-        // n_rank_batches[i] = number of batches assigned to rank i
-        // each batch initially recieves N_batches/N_ranks batches
-        std::vector<int> n_rank_batches(sqd_data.mpi_size, n_batches / sqd_data.mpi_size);
-        // then, the reminder of N_batches/N_ranks is assigned to the first ranks
-        for (int r = 0; r < n_batches % sqd_data.mpi_size; ++r) 
+        // ===== BATCHES SPLIT ACROSS MPI NODES =====
+        // n_node_batches[i] = number of batches assigned to node i
+        // each node initially recieves N_batches/num_nodes batches
+        std::vector<int> n_node_batches(num_nodes, n_batches / num_nodes);
+        // then, the reminder of N_batches/num_nodes is assigned to the first nodes
+        for (int r = 0; r < n_batches % num_nodes; ++r) 
         {
-            n_rank_batches[r] += 1; 
+            n_node_batches[r] += 1; 
         }
-        log(sqd_data, {"Rank ", std::to_string(sqd_data.mpi_rank), 
-                       " processes ", std::to_string(n_rank_batches[sqd_data.mpi_rank]), " batches."});
+        // ask only ranks in node leaders comm to print the batch assignment
+        if (is_node_leader) 
+        {
+            log(sqd_data, {"Node ", std::to_string(leaders_rank), 
+                           " assigned ", std::to_string(n_node_batches[leaders_rank]), " batches."});
+        }
+        //log(sqd_data, {"Rank ", std::to_string(sqd_data.mpi_rank), 
+        //               " processes ", std::to_string(n_node_batches[sqd_data.mpi_rank]), " batches."});
         
-        // initialize vector of batches (size: n_rank_batches[rank] each batch is a vector of dynamic_bitset) 
-        std::vector<std::vector<boost::dynamic_bitset<>>> batches(n_rank_batches[sqd_data.mpi_rank]);
+        // now syncronize all ranks on same node using node_comm:
+        // each rank gets the leaders_rank stored in node_id variable, to be used as index for n_node_batches
+        int node_id = leaders_rank;
+        MPI_Bcast(&node_id, 1, MPI_INT, 0, node_comm); 
+
+        // initialize vector of batches (size: n_node_batches[rank] each batch is a vector of dynamic_bitset) 
+        std::vector<std::vector<boost::dynamic_bitset<>>> batches(n_node_batches[node_id]);
         
         // Subsample batches of bitstrings for SBD input.
-        // Each rank populates its own batches vector of size n_rank_batches[rank]
+        // Each rank populates its own batches vector of size n_node_batches[rank]
         Qiskit::addon::sqd::subsample_multiple_batches(batches, postselected_bitstrings, postselected_probs,
-                                      samples_per_batch, n_rank_batches[sqd_data.mpi_rank], rng);
+                                      samples_per_batch, n_node_batches[node_id], rng);
         // old version, hardcoded for single batch
         //Qiskit::addon::sqd::subsample(batch, postselected_bitstrings, postselected_probs,
         //                              samples_per_batch, rng);
@@ -697,7 +707,7 @@ int main(int argc, char* argv[])
         std::vector<double> local_energies;
         std::vector<std::vector<double>> local_occs;
 
-        // iterate over batches assigned to this rank
+        // iterate over batches assigned to this node
         for (size_t b = 0; b < batches.size(); ++b)
         {
             
@@ -707,7 +717,7 @@ int main(int argc, char* argv[])
                                      sqd_data.samples_per_batch * 2, i_recovery);
             
             // Run SBD for this batch
-            auto [energy_sci, occs_batch] = sbd_main(sqd_data.comm, diag_data);
+            auto [energy_sci, occs_batch] = sbd_main(node_comm, diag_data);
             //double energy_sci = -300.0;
             //std::vector<double> occs_batch(2 * norb, 1.0);
 
@@ -716,10 +726,10 @@ int main(int argc, char* argv[])
             local_occs.push_back(occs_batch);
         
             // log results 
-                log(sqd_data, {"Rank ", std::to_string(sqd_data.mpi_rank), 
-                               ", batch ", std::to_string(b),
-                               ", energy: ", std::to_string(energy_sci),
-                               " (iteration ", std::to_string(i_recovery), ")"});
+            log(sqd_data, {"Rank ", std::to_string(sqd_data.mpi_rank), 
+                           ", batch ", std::to_string(b),
+                           ", energy: ", std::to_string(energy_sci),
+                           " (iteration ", std::to_string(i_recovery), ")"});
         }
 
         // variables for rank 0 to collect final energies from all batches from all ranks
@@ -748,7 +758,7 @@ int main(int argc, char* argv[])
 
         */
         // collect the number of batches from each rank into recvcounts array on rank 0
-        // si può usare n_rank_batches 
+        // si può usare n_node_batches 
         /*
         MPI_Gather(&local_n_batches, 
                    1, 
@@ -761,12 +771,12 @@ int main(int argc, char* argv[])
 
         if (sqd_data.mpi_rank == 0) 
         {
-            // compute displacements based on n_rank_batches
+            // compute displacements based on n_node_batches
             int total = 0;
             for (int i = 0; i < sqd_data.mpi_size; ++i) 
             {
                 displs[i] = total;
-                total += n_rank_batches[i];
+                total += n_node_batches[i];
             }
             all_energies.resize(total);
         }
@@ -787,10 +797,10 @@ int main(int argc, char* argv[])
         */
         // collect energies from all ranks into all_energies array on rank 0
         MPI_Gatherv(local_energies.data(), 
-                    n_rank_batches[sqd_data.mpi_rank], 
+                    n_node_batches[sqd_data.mpi_rank], 
                     MPI_DOUBLE, 
                     all_energies.data(), 
-                    n_rank_batches.data(), 
+                    n_node_batches.data(), 
                     displs.data(), 
                     MPI_DOUBLE, 
                     0, 
@@ -815,7 +825,7 @@ int main(int argc, char* argv[])
             local_occs_flat.insert(local_occs_flat.end(), occ.begin(), occ.end());
 
         // Gather occupancy sizes
-        int local_total_occ = n_rank_batches[sqd_data.mpi_rank] * occ_size;
+        int local_total_occ = n_node_batches[sqd_data.mpi_rank] * occ_size;
         // similar to before, but now for occupancies
         // on rank 0, recvcounts_occ[i] = length of local_occs_flat from rank i
         // on rank 0, displs_occ[i] = displacement in final array where rank i's data starts
