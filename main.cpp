@@ -290,8 +290,8 @@ int main(int argc, char* argv[])
             MPI_Abort(sqd_data.comm, 1);
             return 1;
         }
-        log(sqd_data,
-            {"initial parameters are loaded. param_length=", std::to_string(init_params.size())});
+        //log(sqd_data,
+        //    {"initial parameters are loaded. param_length=", std::to_string(init_params.size())});
     }
 
     auto num_elec_a = nelec.first;
@@ -304,7 +304,7 @@ int main(int argc, char* argv[])
     double end_intro = MPI_Wtime();
     if (sqd_data.mpi_rank == 0)
     {
-        std::cout << "Setup time: " << (end_intro - start_intro) << " seconds" << std::endl;
+        std::cout << "TIME: setup " << (end_intro - start_intro) << " seconds" << std::endl;
     }
     
     double start_quantum = MPI_Wtime();
@@ -467,7 +467,7 @@ int main(int argc, char* argv[])
     double end_quantum = MPI_Wtime();
     if (sqd_data.mpi_rank == 0)
     {
-        std::cout << "Quantum + quantum data distribution execution time: " << (end_quantum - start_quantum) << " seconds" << std::endl;
+        std::cout << "TIME: quantum circuit + quantum data distribution " << (end_quantum - start_quantum) << " seconds" << std::endl;
     }
     
     // =====  Configuration Recovery, Post Selection, Diagonalization ===== 
@@ -613,8 +613,8 @@ int main(int argc, char* argv[])
         double end_recovery = MPI_Wtime();
         if (sqd_data.mpi_rank == 0)
         {
-            std::cout << "Recovery + post-selection time (this iteration): " << (end_recovery - start_recovery) << " seconds" << std::endl;
-            std::cout << "Number of postselected bitstrings (this iteration): " << postselected_bitstrings.size() << std::endl;
+            std::cout << "TIME: recovery + post-selection " << (end_recovery - start_recovery) << " seconds" << std::endl;
+            //std::cout << "Number of postselected bitstrings (this iteration): " << postselected_bitstrings.size() << std::endl;
         }
 
         /* OLD VERSION, DOING RECOVERY AND POSTSELECTION ONLY ON RANK 0 THEN BROADCAST
@@ -714,6 +714,7 @@ int main(int argc, char* argv[])
         */ // END OLD VERSION
 
         // ===== BATCHES SPLIT ACROSS MPI NODES =====
+        double start_sampling = MPI_Wtime();
         // n_node_batches[i] = number of batches assigned to node i
         // each node initially recieves N_batches/num_nodes batches
         std::vector<int> n_node_batches(num_nodes, n_batches / num_nodes);
@@ -748,15 +749,25 @@ int main(int argc, char* argv[])
         // old version, hardcoded for single batch
         //Qiskit::addon::sqd::subsample(batch, postselected_bitstrings, postselected_probs,
         //                              samples_per_batch, rng);
+
+        double end_sampling = MPI_Wtime();
+        if (is_node_leader)
+        {
+            std::cout << "TIME: batch sampling " << (end_sampling - start_sampling) << " seconds" << std::endl;
+        }
         
         // variables to store node-specific energies and occupations
         // (vectors of one element per processed batch)
         std::vector<double> local_energies;
         std::vector<std::vector<double>> local_occs;
 
+        double start_diag;
+        double end_diag;
+
         // iterate over batches assigned to this node
         for (size_t b = 0; b < batches.size(); ++b)
         {
+            start_diag = MPI_Wtime();
             // node leader writes alpha-determinants file for this batch
             if (is_node_leader) 
             {
@@ -784,6 +795,8 @@ int main(int argc, char* argv[])
             // Save results for this batch
             local_energies.push_back(energy_sci);
             local_occs.push_back(occs_batch);
+
+            end_diag = MPI_Wtime();
         
             // log results 
             if (is_node_leader) 
@@ -792,10 +805,13 @@ int main(int argc, char* argv[])
                            ", batch ", std::to_string(b),
                            ", energy: ", std::to_string(energy_sci),
                            " (iteration ", std::to_string(i_recovery), ")"});
+            std::cout << "TIME: diagonalization " << (end_diag - start_diag) << " seconds" << std::endl;
             }
         }
 
         // ===== COLLECT AND POST-PROCESS RESULTS =====
+
+        double start_postprocess = MPI_Wtime();
         
         // (1) compute sum of occupations across all batches on this node (stored in node_sum_occ)
         int occ_size = local_occs.empty() ? 0 : static_cast<int>(local_occs[0].size());   
@@ -839,6 +855,12 @@ int main(int argc, char* argv[])
         {
             MPI_Reduce(&node_best_E, &best_E, 1, MPI_DOUBLE, MPI_MIN, 0, leaders_comm); 
         }
+
+        double end_postprocess = MPI_Wtime();
+        if (is_node_leader)
+        {
+            std::cout << "TIME: collect results and postprocess " << (end_postprocess - start_postprocess) << " seconds" << std::endl;
+        }
     }
 
     // End time and report elapsed time
@@ -851,6 +873,11 @@ int main(int argc, char* argv[])
     }
 
     // Synchronize and tear down MPI. No MPI calls are allowed beyond this point.
+    if (leaders_comm != MPI_COMM_NULL) 
+    {
+        MPI_Comm_free(&leaders_comm);
+    }
+    MPI_Comm_free(&node_comm);
     MPI_Finalize();
 
     return 0;

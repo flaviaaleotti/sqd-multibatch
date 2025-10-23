@@ -153,7 +153,7 @@ std::tuple<double, std::vector<double>> sbd_main(const MPI_Comm& comm, const SBD
     MPI_Comm_rank(comm, &mpi_rank);
     int mpi_size;
     MPI_Comm_size(comm, &mpi_size);
-    std::cout<<"SBD: MPI rank/size: " << mpi_rank << "/" << mpi_size << std::endl;
+    //std::cout<<"SBD: MPI rank/size: " << mpi_rank << "/" << mpi_size << std::endl;
     int task_comm_size = sbd_data.task_comm_size;
     int adet_comm_size = sbd_data.adet_comm_size;
     int bdet_comm_size = sbd_data.bdet_comm_size;
