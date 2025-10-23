@@ -20,6 +20,10 @@
 #include <iostream>
 #include <random>
 
+#include <iomanip>
+#include <sstream>
+#include <string>
+
 #ifdef _MSC_VER
 #include <windows.h>
 #else
@@ -103,6 +107,40 @@ SBD generate_sbd_data(int argc, char* argv[])
     }
     return sbd;
 }
+
+// --- helper: sum of alpha and beta bits at each position
+static std::string sum_alpha_beta_bits(const std::vector<size_t>& alpha,
+                                       const std::vector<size_t>& beta,
+                                       int L) {
+    const int word_bits = sizeof(size_t) * 8;
+    std::string s;
+    s.reserve(L);
+    for (int i = 0; i < L; ++i) {
+        int word = i / word_bits;
+        int bit  = i % word_bits;
+        int a_bit = 0, b_bit = 0;
+        if (word < static_cast<int>(alpha.size()))
+            a_bit = (alpha[word] >> bit) & 1;
+        if (word < static_cast<int>(beta.size()))
+            b_bit = (beta[word] >> bit) & 1;
+        s.push_back('0' + a_bit + b_bit);  // '0', '1', or '2'
+    }
+    return s;
+}
+
+// then use it for determinant index
+static std::string det_index_to_sumbits(const std::vector<std::vector<size_t>>& adet,
+                                        const std::vector<std::vector<size_t>>& bdet,
+                                        size_t idx, int L) {
+    size_t n_alpha = adet.size();
+    size_t n_beta  = bdet.size();
+    if (n_alpha == 0 || n_beta == 0) return std::string();
+    size_t alpha_idx = idx / n_beta;
+    size_t beta_idx  = idx % n_beta;
+    if (alpha_idx >= n_alpha || beta_idx >= n_beta) return std::string();
+    return sum_alpha_beta_bits(adet[alpha_idx], bdet[beta_idx], L);
+}
+
 
 // energy, occupancy
 std::tuple<double, std::vector<double>> sbd_main(const MPI_Comm& comm, const SBD& sbd_data)
@@ -248,7 +286,48 @@ std::tuple<double, std::vector<double>> sbd_main(const MPI_Comm& comm, const SBD
             .count();
     double elapsed_diag = 0.000001 * elapsed_diag_count;
     if (mpi_rank == 0)
+    {
         std::cout << " Elapsed time for diagonalization " << elapsed_diag << " (sec) " << std::endl;
+
+        // pick threshold (you already defined threshold earlier)
+        double local_threshold = (sbd_data.threshold != 0.0) ? sbd_data.threshold : 0.0000005;
+        
+        // Prepare output filename per rank to avoid complicated gather
+        std::ostringstream fname;
+        fname << "ci_coeffs.txt";
+        std::ofstream out(fname.str());
+        if (!out) {
+            std::cerr << "Could not open output file " << fname.str() << std::endl;
+        } else {
+            // Header
+            out << std::scientific << std::setprecision(12);
+            out << "# coeff    bitstring(alpha then beta)\n";
+        
+            size_t n_alpha = adet.size();
+            size_t n_beta  = bdet.size();
+            size_t expected_size = n_alpha * n_beta;
+            if (W.size() != expected_size) {
+                // It's possible your basis ordering / size is different.
+                // Still iterate min(W.size(), expected_size) and warn.
+                std::cerr << "Warning: W.size()=" << W.size()
+                          << " != n_alpha*n_beta=" << expected_size << ". Proceeding with min size.\n";
+            }
+        
+            size_t max_idx = std::min(W.size(), expected_size);
+            for (size_t idx = 0; idx < max_idx; ++idx) {
+                double coeff = W[idx];
+                if (std::abs(coeff) > local_threshold) {
+                    std::string sum_bits = det_index_to_sumbits(adet, bdet, idx, L);
+                    int n_ones = std::count(sum_bits.begin(), sum_bits.end(), '1');
+                    out << coeff << " " << coeff * coeff << " " << sum_bits
+                        << "  # n1=" << n_ones << "\n";
+                }
+            }
+            out.close();
+            //if (mpi_rank == 0)
+            //    std::cout << "Wrote local significant CI coefficients to " << fname.str() << std::endl;
+        }
+    }
 
     /**
          Evaluation of Hamiltonian expectation value

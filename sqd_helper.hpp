@@ -414,7 +414,7 @@ void write_bytestrings_to_file(const std::vector<std::vector<uint8_t>>& byte_str
 
 std::string write_alphadets_file(const SQD& sqd_data, const size_t norb, const size_t num_elec,
                                  const std::vector<BitString>& batch,
-                                 const size_t maximum_numbers_of_ctrs, const size_t i_recovery)
+                                 const size_t maximum_numbers_of_ctrs, const size_t i_recovery, const int node_id)
 {
     //log(sqd_data, {"number of items in a batch: ", std::to_string(batch.size())});
     bool open_shell = false;
@@ -442,7 +442,7 @@ std::string write_alphadets_file(const SQD& sqd_data, const size_t norb, const s
     //    "AlphaDets_" + sqd_data.run_id + "_" + std::to_string(i_recovery) + "_cpp.bin";
     // Flavia: new file name to differentiate among MPI ranks
     std::string alphadets_bin_file =
-        "AlphaDets_" + sqd_data.run_id + "_" + std::to_string(i_recovery) + "_rank_" + std::to_string(sqd_data.mpi_rank) + "_cpp.bin";
+        "AlphaDets_" + sqd_data.run_id + "_" + std::to_string(i_recovery) + "_node_" + std::to_string(node_id) + "_cpp.bin";
     write_bytestrings_to_file(bytestrings, alphadets_bin_file);
     return alphadets_bin_file;
 }

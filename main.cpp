@@ -20,6 +20,7 @@
 #include <random>
 #include <string>
 #include <unordered_map>
+#include <chrono>
 
 #include "boost/dynamic_bitset.hpp"
 #include "ffsim/ucj.hpp"
@@ -186,6 +187,9 @@ using namespace ffsim;
 
 int main(int argc, char* argv[])
 {
+    // Start time
+    auto start = std::chrono::high_resolution_clock::now();   // start timer
+    
     // ===== MPI initialization =====
     // This workflow assumes MPI. Request FUNNELED (only main thread calls MPI).
     int provided;
@@ -200,6 +204,8 @@ int main(int argc, char* argv[])
         std::cerr << "MPI_Init failed: " << err_msg << std::endl;
         return mpi_init_error;
     }
+    
+    double start_intro = MPI_Wtime();
 
     // ===== SBD (diagonalization sub-workflow) configuration =====
     // Build SBD parameters from CLI args. Used by sbd_main for energy evaluation, etc.
@@ -208,11 +214,14 @@ int main(int argc, char* argv[])
     // ===== SQD (sampling/recovery sub-workflow) configuration =====
     // Holds run_id, backend, shot count, and other metadata for sampling and recovery.
     SQD sqd_data = generate_sqd_data(argc, argv);
+    
+    // ===== MPI communicator setup =====
+    // global communicator
     sqd_data.comm = MPI_COMM_WORLD;
     MPI_Comm_rank(sqd_data.comm, &sqd_data.mpi_rank);
     MPI_Comm_size(sqd_data.comm, &sqd_data.mpi_size);
 
-    //create sub-communicators for ranks on same node
+    // sub-communicators for ranks on same node
     MPI_Comm node_comm;
     MPI_Comm_split_type(sqd_data.comm, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL, &node_comm);
     int local_rank;
@@ -233,14 +242,14 @@ int main(int argc, char* argv[])
         MPI_Comm_size(leaders_comm, &num_nodes);
     }
 
-    // Broadcast num_nodes to everyone
+    // Broadcast num_nodes to everyone (also non-leaders)
     MPI_Bcast(&num_nodes, 1, MPI_INT, 0, MPI_COMM_WORLD);
 
     std::cout << "Rank " << sqd_data.mpi_rank << " / " << sqd_data.mpi_size
               << " is on node rank " << local_rank
               << ", total nodes = " << num_nodes << std::endl;
-
-    //std::cout<<"MPI rank/size: " << sqd_data.mpi_rank << "/" << sqd_data.mpi_size << std::endl;
+    
+    // ORIGINAL CODE
     int message_size = sqd_data.run_id.size();
     // Send the integer message_size from rank 0 to all others.
     // Others resize their run_id buffer to receive the content.
@@ -253,17 +262,11 @@ int main(int argc, char* argv[])
     // Rank 0 sends the size, others resize buffer, then receive content.
     MPI_Bcast(sqd_data.run_id.data(), message_size, MPI_CHAR, 0, MPI_COMM_WORLD);
 
-    // Random generators:
-    //  - rng    : used for sampling/subsampling (fixed seed for reproducibility).
-    //  - rc_rng : used for configuration recovery randomness (derived from rng).
-    std::mt19937 rng(sqd_data.mpi_rank * sqd_data.mpi_rank + 1234); // different seed per MPI rank
-    std::mt19937 rc_rng(rng());
-
     // Batch sizing for SBD input (alpha-determinant groups).
     uint64_t samples_per_batch = sqd_data.samples_per_batch;
     uint64_t n_batches = sqd_data.n_batches;
-
-    // Read initial parameters (norb, nelec, params for lucj) from JSON.
+    
+    // ===== Read initial parameters (norb, nelec, params for lucj) from JSON =====
     const std::string input_file_path = "../data/parameters_fe4s4.json";
     double tol = 1e-8;
     uint64_t norb;
@@ -291,15 +294,26 @@ int main(int argc, char* argv[])
             {"initial parameters are loaded. param_length=", std::to_string(init_params.size())});
     }
 
+    auto num_elec_a = nelec.first;
+    auto num_elec_b = nelec.second;
+    // Broadcast norb num_elec to all ranks (these quantities will be used by all ranks later)
+    MPI_Bcast(&norb, 1, MPI_UINT64_T, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&num_elec_a, 1, MPI_UINT64_T, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&num_elec_b, 1, MPI_UINT64_T, 0, MPI_COMM_WORLD);
+
+    double end_intro = MPI_Wtime();
+    if (sqd_data.mpi_rank == 0)
+    {
+        std::cout << "Setup time: " << (end_intro - start_intro) << " seconds" << std::endl;
+    }
+    
+    double start_quantum = MPI_Wtime();
+    // ===== Sampling (circuit execution) =====
+    
     // Measurement results: (bitstring -> counts). Produced on rank 0, then array-ified
     // later.
     std::unordered_map<std::string, uint64_t> counts;
-
-    auto num_elec_a = nelec.first;
-    auto num_elec_b = nelec.second;
-    // Broadcast num_elec to all ranks
-    MPI_Bcast(&num_elec_a, 1, MPI_UINT64_T, 0, MPI_COMM_WORLD);
-    MPI_Bcast(&num_elec_b, 1, MPI_UINT64_T, 0, MPI_COMM_WORLD);
+    // Rank 0 performs sampling (real or mock), others wait to receive results.
     if (sqd_data.mpi_rank == 0)
     {
 // ===== Sampling mode switch =====
@@ -403,44 +417,41 @@ int main(int argc, char* argv[])
         // These form the classical distribution for downstream recovery/selection.
         counts = pub_result.data().get_counts();
 #endif // USE_RANDOM_SHOTS
-    }
-
-    ////// Configuration Recovery, Post Selection, Diagonalization //////
-
-    // Broadcast counts from rank 0 to all other ranks.
-    // save number of elements in counts and bitstring length
+    } 
+    
+    // ===== Broadcast sampling results (counts) to all ranks =====
+    // (1) compute and share number of elements in counts
     int n_counts = counts.size();
-    int bitstring_length = 2 * norb; // length of each bitstring (same for all)
-    // Broadcast counts info to all ranks
     MPI_Bcast(&n_counts, 1, MPI_INT, 0, sqd_data.comm);
-    MPI_Bcast(&bitstring_length, 1, MPI_INT, 0, sqd_data.comm);
+    // (2) compute length of single bitstring and total amount of characters to broadcast
+    int bitstring_length = 2 * norb; // length of each bitstring (same for all)
     int total_chars = n_counts * bitstring_length;
 
-    // First flatten keys and values on rank 0
-    std::vector<char> flat_keys;
-    std::vector<uint64_t> flat_values;
-    if (sqd_data.mpi_rank == 0) {
-        flat_keys.reserve(n_counts * bitstring_length);
-        flat_values.reserve(n_counts);
-    
-        for (const auto& [key, val] : counts) {
-            flat_keys.insert(flat_keys.end(), key.begin(), key.end());
-            flat_values.push_back(val);
+    // (3) flatten keys and values of "counts" on rank 0 (for broadcast)
+    std::vector<char> flat_keys(total_chars);
+    std::vector<uint64_t> flat_values(n_counts);
+    if (sqd_data.mpi_rank == 0) 
+    {
+        int offset = 0;
+        int idx = 0;
+        for (const auto& [key, val] : counts) 
+        {
+            std::copy(key.begin(), key.end(), flat_keys.begin() + offset);
+            offset += key.size();
+            flat_values[idx++] = val;
         }
     }
-    // Resize buffers on non-root ranks
-    if (sqd_data.mpi_rank != 0) {
-        flat_keys.resize(total_chars);
-        flat_values.resize(n_counts);
-    }
+    // (4) Broadcast flattened keys and values to all ranks
     MPI_Bcast(flat_keys.data(), total_chars, MPI_CHAR, 0, sqd_data.comm);
     MPI_Bcast(flat_values.data(), n_counts, MPI_UINT64_T, 0, sqd_data.comm);
     
-    // On non-root ranks, reconstruct
-    if (sqd_data.mpi_rank != 0) {
+    // (5) On non-root ranks, reconstruct counts map from received flat arrays
+    if (sqd_data.mpi_rank != 0) 
+    {
         counts.clear();
         int offset = 0;
-        for (int i = 0; i < n_counts; ++i) {
+        for (int i = 0; i < n_counts; ++i) 
+        {
             std::string key(flat_keys.data() + offset, bitstring_length);
             uint64_t val = flat_values[i];
             counts.emplace(key, val);
@@ -450,7 +461,16 @@ int main(int argc, char* argv[])
 
     // Expand counts (map) into (bitstrings[], probs[]).
     auto [bitstring_matrix_full_, probs_arr_full] = counts_to_arrays(counts);
+    // Convert BitString objects to boost::dynamic_bitset<> for internal processing.
     auto bitstring_matrix_full = bitsets_from_bitstrings(bitstring_matrix_full_);
+
+    double end_quantum = MPI_Wtime();
+    if (sqd_data.mpi_rank == 0)
+    {
+        std::cout << "Quantum + quantum data distribution execution time: " << (end_quantum - start_quantum) << " seconds" << std::endl;
+    }
+    
+    // =====  Configuration Recovery, Post Selection, Diagonalization ===== 
 
     std::vector<boost::dynamic_bitset<>> bs_mat_tmp;
     std::vector<double> probs_arr_tmp;
@@ -468,9 +488,11 @@ int main(int argc, char* argv[])
         std::cerr << "Error loading initial occupancies: " << e.what() << std::endl;
         return 1;
     }
+    
+    double best_E = 0.0;
+    
     // ===== Configuration recovery loop (n_recovery iterations) =====
-    // Each iter: recover_configurations → postselect → subsample → SBD (diagonalize) →
-    // update occupancies.
+    // Each iter: recover_configurations → postselect → subsample → SBD (diagonalize) → update occupancies.
     for (uint64_t i_recovery = 0; i_recovery < n_recovery; ++i_recovery)
     {
         
@@ -488,30 +510,31 @@ int main(int argc, char* argv[])
             latest_occupancies = initial_occupancies;
         }
 
-        // ===== BITSTRINGS & PROBABILITIES FOR SAMPLING =====
-        // vectors for postselected bitstrings and probabilities
-        //std::vector<double> postselected_probs;
-        //std::vector<boost::dynamic_bitset<>> postselected_bitstrings;
-
-        // RECOVERY & POST-SELECTION of BITSTRINGS and PROBABILITIES
+        // ===== RECOVERY & POST-SELECTION of BITSTRINGS and PROBABILITIES =====
 
         // Recover physically consistent configurations from observed probabilities + prior occupancies.
-        // Split across MPI ranks for scalability.
-        size_t N = bitstring_matrix_full.size();
+        // Random generator:
+        //  - rc_rng : used for configuration recovery randomness (derived from rng).
+        std::mt19937 rc_rng(sqd_data.mpi_rank * sqd_data.mpi_rank + 5678); // different seed per MPI rank
+
+        // (split across MPI ranks for scalability)
+        double start_recovery = MPI_Wtime();
+        size_t N = bitstring_matrix_full.size(); // total number of bitstrings sampled from qpu
         size_t chunk = N / sqd_data.mpi_size;
         size_t remainder = N % sqd_data.mpi_size;
         // each rank gets a chunk, ranks whose ID is lower than remainder get an extra item
         size_t start = sqd_data.mpi_rank * chunk + std::min<size_t>(sqd_data.mpi_rank, remainder);
         size_t end   = start + chunk + (sqd_data.mpi_rank < remainder ? 1 : 0);
 
+        // local slices of bitstrings and probabilities for this rank
         std::vector<boost::dynamic_bitset<>> local_bitstrings(bitstring_matrix_full.begin() + start, bitstring_matrix_full.begin() + end);
         std::vector<double> local_probs(probs_arr_full.begin() + start, probs_arr_full.begin() + end);
 
         auto recovered = Qiskit::addon::sqd::recover_configurations(
             local_bitstrings, local_probs, latest_occupancies, {num_elec_a, num_elec_b},
             rc_rng);
-        bs_mat_tmp = std::move(recovered.first);
-        probs_arr_tmp = std::move(recovered.second);
+        bs_mat_tmp = std::move(recovered.first); // take recovered bitstrings from first element of "recovered"
+        probs_arr_tmp = std::move(recovered.second); // take recovered probabilities from second element of "recovered"
 
         // Post-selection: accept bitstrings whose left/right (alpha/beta) Hamming
         // weights match target electron counts.
@@ -520,11 +543,13 @@ int main(int argc, char* argv[])
                 bs_mat_tmp, probs_arr_tmp,
                 Qiskit::addon::sqd::MatchesRightLeftHamming(num_elec_a, num_elec_b));
             
-        auto &local_postselected_bitstrings = result.first;
-        auto &local_postselected_probs      = result.second;
+        auto &local_postselected_bitstrings = result.first; // take postselected bitstrings from first element of "result"
+        auto &local_postselected_probs      = result.second; // take postselected probabilities from second element of "result"
         int local_N = local_postselected_bitstrings.size();
 
-        std::vector<char> local_flat_keys(local_N * bitstring_length);
+        // Gather postselected bitstrings and probs from all ranks:
+        // (1) convert local bitstrings to char and store them in flat array
+        std::vector<char> local_flat_keys(local_N * bitstring_length);  
         for (int i = 0; i < local_N; ++i)
         {
             std::string s;
@@ -533,20 +558,34 @@ int main(int argc, char* argv[])
             memcpy(&local_flat_keys[i * bitstring_length], s.data(), bitstring_length);
         }
 
-        std::vector<double> local_flat_probs(local_postselected_probs.begin(), local_postselected_probs.end());
-
-        // Gather sizes from all ranks
-        std::vector<int> recv_counts(sqd_data.mpi_size);
+        // (2) Probabilities
+        // (2.a) Make each rank aware of how much data to expect from other ranks (local_N sizes)
+        // (MPI_Allgather: Gathers data from all processes and distributes it to all processes)
+        std::vector<int> recv_counts(sqd_data.mpi_size); // store sizes from all ranks in recv_counts array
         MPI_Allgather(&local_N, 1, MPI_INT, recv_counts.data(), 1, MPI_INT, sqd_data.comm);
-
-        std::vector<int> displs(sqd_data.mpi_size, 0);
+        
+        // (2.b) compute and store the start indices (displacements) for each rank's probability data in the global arrays
+        std::vector<int> displs(sqd_data.mpi_size, 0); // starting offset (index) in the global array where rank i’s data should start to be placed
         for (int i = 1; i < sqd_data.mpi_size; ++i)
+        {
             displs[i] = displs[i-1] + recv_counts[i-1];
-        int total_count = displs.back() + recv_counts.back();
+        }
+        // (2.c) compute total number of items (postselected bitstrings/probabilities) across all ranks
+        // we could sum over elements of recv_counts, but it is more efficient to use the last element of displs
+        // (which is already the sum of all elements of recv_counts except the last one) and simply add the last element of recv_counts
+        int total_postselect_bitstr = displs.back() + recv_counts.back(); 
 
-        std::vector<char> global_flat_keys(total_count * bitstring_length);
-        std::vector<double> global_flat_probs(total_count);
+        // (2.d) allocate global array to receive all data
+        std::vector<double> postselected_probs(total_postselect_bitstr);
 
+        // (2.e) gather all probabilities into postselected_probs
+        // (MPI_Allgatherv: Gathers data from all processes and delivers it to all. Each process may contribute a different amount of data)
+        MPI_Allgatherv(local_postselected_probs.data(), local_N, MPI_DOUBLE,
+                       postselected_probs.data(), recv_counts.data(),
+                       displs.data(), MPI_DOUBLE, sqd_data.comm);
+
+        // (3) Bitstrings
+        // (3.a) compute and store local amounts of data and displacements also for bitstrings (chars)
         std::vector<int> recv_counts_keys(sqd_data.mpi_size);
         std::vector<int> displs_keys(sqd_data.mpi_size);
         for (int i = 0; i < sqd_data.mpi_size; ++i) 
@@ -555,22 +594,28 @@ int main(int argc, char* argv[])
             displs_keys[i] = displs[i] * bitstring_length;
         }
 
+        // (3.b) allocate global (flat) array to receive all bitstrings
+        std::vector<char> global_flat_keys(total_postselect_bitstr * bitstring_length);
+
+        // (3.c) gather all bitstrings into global_flat_keys
         MPI_Allgatherv(local_flat_keys.data(), local_N * bitstring_length, MPI_CHAR,
                        global_flat_keys.data(), recv_counts_keys.data(),
                        displs_keys.data(), MPI_CHAR, sqd_data.comm);
 
-        MPI_Allgatherv(local_flat_probs.data(), local_N, MPI_DOUBLE,
-                       global_flat_probs.data(), recv_counts.data(),
-                       displs.data(), MPI_DOUBLE, sqd_data.comm);
-        
-        std::vector<boost::dynamic_bitset<>> postselected_bitstrings(total_count);
-        for (int i = 0; i < total_count; ++i) 
+        // (4) Reconstruct postselected bitstrings in correct format from global_flat_keys
+        std::vector<boost::dynamic_bitset<>> postselected_bitstrings(total_postselect_bitstr);
+        for (int i = 0; i < total_postselect_bitstr; ++i) 
         {
             std::string s(&global_flat_keys[i * bitstring_length], bitstring_length);
             postselected_bitstrings[i] = boost::dynamic_bitset<>(s);
         }
 
-        std::vector<double> postselected_probs = std::move(global_flat_probs);
+        double end_recovery = MPI_Wtime();
+        if (sqd_data.mpi_rank == 0)
+        {
+            std::cout << "Recovery + post-selection time (this iteration): " << (end_recovery - start_recovery) << " seconds" << std::endl;
+            std::cout << "Number of postselected bitstrings (this iteration): " << postselected_bitstrings.size() << std::endl;
+        }
 
         /* OLD VERSION, DOING RECOVERY AND POSTSELECTION ONLY ON RANK 0 THEN BROADCAST
         // flat version of bitstrings for broadcasting (needed because we cannot broadcast vector<string>)
@@ -677,14 +722,12 @@ int main(int argc, char* argv[])
         {
             n_node_batches[r] += 1; 
         }
-        // ask only ranks in node leaders comm to print the batch assignment
+        // ask only node leaders to print the batch assignment
         if (is_node_leader) 
         {
             log(sqd_data, {"Node ", std::to_string(leaders_rank), 
                            " assigned ", std::to_string(n_node_batches[leaders_rank]), " batches."});
         }
-        //log(sqd_data, {"Rank ", std::to_string(sqd_data.mpi_rank), 
-        //               " processes ", std::to_string(n_node_batches[sqd_data.mpi_rank]), " batches."});
         
         // now syncronize all ranks on same node using node_comm:
         // each rank gets the leaders_rank stored in node_id variable, to be used as index for n_node_batches
@@ -693,6 +736,10 @@ int main(int argc, char* argv[])
 
         // initialize vector of batches (size: n_node_batches[rank] each batch is a vector of dynamic_bitset) 
         std::vector<std::vector<boost::dynamic_bitset<>>> batches(n_node_batches[node_id]);
+
+        // Random generator:
+        //  - rng    : used for sampling/subsampling (fixed seed for reproducibility).
+        std::mt19937 rng(node_id * node_id + 1234); // different seed per MPI node rank
         
         // Subsample batches of bitstrings for SBD input.
         // Each rank populates its own batches vector of size n_node_batches[rank]
@@ -702,7 +749,7 @@ int main(int argc, char* argv[])
         //Qiskit::addon::sqd::subsample(batch, postselected_bitstrings, postselected_probs,
         //                              samples_per_batch, rng);
         
-        // variables to store rank-specific energies and occupations
+        // variables to store node-specific energies and occupations
         // (vectors of one element per processed batch)
         std::vector<double> local_energies;
         std::vector<std::vector<double>> local_occs;
@@ -710,243 +757,102 @@ int main(int argc, char* argv[])
         // iterate over batches assigned to this node
         for (size_t b = 0; b < batches.size(); ++b)
         {
-            
-            // Write alpha-determinants file for this batch
-            diag_data.adetfile =
-                write_alphadets_file(sqd_data, norb, num_elec_a, bitsets_to_bitstrings(batches[b]),
-                                     sqd_data.samples_per_batch * 2, i_recovery);
-            
+            // node leader writes alpha-determinants file for this batch
+            if (is_node_leader) 
+            {
+                diag_data.adetfile =
+                    write_alphadets_file(sqd_data, norb, num_elec_a, bitsets_to_bitstrings(batches[b]),
+                                         sqd_data.samples_per_batch * 2, i_recovery, node_id);
+            }
+
+            // node leader broadcasts the adetfile path to all ranks on same node
+            int path_length = 0;
+            if (is_node_leader) 
+            {
+                path_length = diag_data.adetfile.size();
+            }
+            MPI_Bcast(&path_length, 1, MPI_INT, 0, node_comm);
+            if (!is_node_leader) 
+            {
+                diag_data.adetfile.resize(path_length);
+            }
+            MPI_Bcast(diag_data.adetfile.data(), path_length, MPI_CHAR, 0, node_comm);  
+
             // Run SBD for this batch
             auto [energy_sci, occs_batch] = sbd_main(node_comm, diag_data);
-            //double energy_sci = -300.0;
-            //std::vector<double> occs_batch(2 * norb, 1.0);
 
             // Save results for this batch
             local_energies.push_back(energy_sci);
             local_occs.push_back(occs_batch);
         
             // log results 
-            log(sqd_data, {"Rank ", std::to_string(sqd_data.mpi_rank), 
+            if (is_node_leader) 
+            {
+            log(sqd_data, {"Node ", std::to_string(leaders_rank), 
                            ", batch ", std::to_string(b),
                            ", energy: ", std::to_string(energy_sci),
                            " (iteration ", std::to_string(i_recovery), ")"});
+            }
         }
 
-        // variables for rank 0 to collect final energies from all batches from all ranks
-        // int local_n_batches = local_energies.size();
-        // recvcounts[i] = number of batches from rank i
-        // displs[i] = displacement (offset) in the final array where rank i's data starts
-        std::vector<int> recvcounts;
-        std::vector<double> all_energies;
-
-        if (sqd_data.mpi_rank == 0) 
+        // ===== COLLECT AND POST-PROCESS RESULTS =====
+        
+        // (1) compute sum of occupations across all batches on this node (stored in node_sum_occ)
+        int occ_size = local_occs.empty() ? 0 : static_cast<int>(local_occs[0].size());   
+        std::vector<double> node_sum_occ(occ_size, 0.0);
+        for (auto &occ : local_occs)
+            for (size_t i = 0; i < occ_size; ++i)
+                node_sum_occ[i] += occ[i]; 
+        
+        // (2) reduce (+) across all nodes (using leaders_comm)
+        // (the total sum is stored in avg_occs on node leader 0, then divided by n_batches to get average)
+        std::vector<double> avg_occs(occ_size, 0.0);
+        if (is_node_leader) 
         {
-            //recvcounts.resize(sqd_data.mpi_size);
-            displs.resize(sqd_data.mpi_size);
-        }
-        /*
-        int MPI_Gather(
-            const void *sendbuf,  // Starting address of send buffer
-            int sendcount,        // Number of elements to send
-            MPI_Datatype sendtype,// Data type of send buffer elements
-            void *recvbuf,        // Starting address of receive buffer (root only)
-            int recvcount,        // Number of elements received from each process (root only)
-            MPI_Datatype recvtype,// Data type of receive buffer elements (root only)
-            int root,             // Rank of the root process
-            MPI_Comm comm         // Communicator
-        );
-
-        */
-        // collect the number of batches from each rank into recvcounts array on rank 0
-        // si può usare n_node_batches 
-        /*
-        MPI_Gather(&local_n_batches, 
-                   1, 
-                   MPI_INT, 
-                   recvcounts.data(), 
-                   1, 
-                   MPI_INT, 
-                   0, 
-                   sqd_data.comm);*/
-
-        if (sqd_data.mpi_rank == 0) 
-        {
-            // compute displacements based on n_node_batches
-            int total = 0;
-            for (int i = 0; i < sqd_data.mpi_size; ++i) 
-            {
-                displs[i] = total;
-                total += n_node_batches[i];
-            }
-            all_energies.resize(total);
-        }
-        
-        /*
-        Gartherv allows to send a variable amount of data from each rank.
-        int MPI_Gatherv(
-            const void *sendbuf,    // Starting address of send buffer
-            int sendcount,          // Number of elements to send
-            MPI_Datatype sendtype,  // Data type of send buffer elements
-            void *recvbuf,          // Starting address of receive buffer (root only)
-            const int recvcounts[], // Array specifying the number of elements received from each process
-            const int displs[],     // Array specifying displacements in the receive buffer
-            MPI_Datatype recvtype,  // Data type of receive buffer elements
-            int root,               // Rank of the root process
-            MPI_Comm comm           // Communicator
-        );
-        */
-        // collect energies from all ranks into all_energies array on rank 0
-        MPI_Gatherv(local_energies.data(), 
-                    n_node_batches[sqd_data.mpi_rank], 
-                    MPI_DOUBLE, 
-                    all_energies.data(), 
-                    n_node_batches.data(), 
-                    displs.data(), 
-                    MPI_DOUBLE, 
-                    0, 
-                    sqd_data.comm);
-        
-        // Print all energies (for debugging)
-        if (sqd_data.mpi_rank == 0) 
-        {
-            std::cout << "all_energies = [";
-            for (size_t i = 0; i < all_energies.size(); ++i) {
-                if (i > 0) std::cout << ", ";
-                std::cout << all_energies[i];
-            }
-            std::cout << "]\n";
-        }
-
-        // On all ranks, flatten local_occs (vector<vector<double>>) to a single vector
-        // (flattening is needed for MPI communication)
-        int occ_size = local_occs.empty() ? 0 : local_occs[0].size();
-        std::vector<double> local_occs_flat;
-        for (const auto& occ : local_occs)
-            local_occs_flat.insert(local_occs_flat.end(), occ.begin(), occ.end());
-
-        // Gather occupancy sizes
-        int local_total_occ = n_node_batches[sqd_data.mpi_rank] * occ_size;
-        // similar to before, but now for occupancies
-        // on rank 0, recvcounts_occ[i] = length of local_occs_flat from rank i
-        // on rank 0, displs_occ[i] = displacement in final array where rank i's data starts
-        std::vector<int> recvcounts_occ, displs_occ;
-        // arrays for rank 0 to collect all occupancies from all ranks
-        std::vector<double> all_occs_flat;
-        std::vector<std::vector<double>> all_occs;
-        
-        if (sqd_data.mpi_rank == 0) 
-        {
-            recvcounts_occ.resize(sqd_data.mpi_size);
-            displs_occ.resize(sqd_data.mpi_size);
-        }
-        // gather the sizes of local_occs_flat from all ranks into recvcounts_occ on rank 0
-        MPI_Gather(&local_total_occ, 
-                   1, 
-                   MPI_INT,
-                   recvcounts_occ.data(), 
-                   1, 
-                   MPI_INT, 
-                   0, 
-                   sqd_data.comm);
-        
-        if (sqd_data.mpi_rank == 0) 
-        {
-            // compute displacements based on recvcounts_occ
-            int total_occ = 0;
-            for (int i = 0; i < sqd_data.mpi_size; ++i) {
-                displs_occ[i] = total_occ;
-                total_occ += recvcounts_occ[i];
-            }
-            all_occs_flat.resize(total_occ);
-        }
-        
-        // gather all local_occs_flat into all_occs_flat on rank 0
-        MPI_Gatherv(local_occs_flat.data(), 
-                    local_total_occ, 
-                    MPI_DOUBLE,
-                    all_occs_flat.data(), 
-                    recvcounts_occ.data(), 
-                    displs_occ.data(), 
-                    MPI_DOUBLE,
-                    0, 
-                    sqd_data.comm);
-        
-        // On rank 0, reconstruct all_occs (vector of vector<double>) from all_occs_flat
-        // each batch has occ_size elements, so we can split all_occs_flat accordingly
-        if (sqd_data.mpi_rank == 0) 
-        {
-            int total_batches = all_energies.size();
-            all_occs.reserve(total_batches);
-            for (int i = 0; i < total_batches; ++i) {
-                all_occs.emplace_back(
-                    all_occs_flat.begin() + i * occ_size,
-                    all_occs_flat.begin() + (i + 1) * occ_size
-                );
-            }
-            // Now all_energies[i] and all_occs[i] correspond to batch i
-
-            assert(!all_occs.empty());
-
-            // initialize vector to hold average occupancies (avg on all batches)
-            std::vector<double> avg_occs(occ_size, 0.0);
-        
-            // Sum over all batches
-            for (const auto& occ : all_occs) 
-            {
-                for (size_t j = 0; j < occ_size; ++j) 
-                {
-                    avg_occs[j] += occ[j];
-                }
-            }
-            // Divide by number of batches to get the average
-            for (size_t j = 0; j < occ_size; ++j) 
-            {
-                avg_occs[j] /= static_cast<double>(total_batches);
-            }
-        
-            // Print the result (debugging)
-            std::cout << "avg_occs = [";
-            for (size_t j = 0; j < avg_occs.size(); ++j) {
-                if (j > 0) std::cout << ", ";
-                std::cout << avg_occs[j];
-            }
-            std::cout << "]\n";
-
-            // Convert interleaved [alpha0, beta0, alpha1, beta1, ...] to { alpha[], beta[]
-            // }. NOTE: assert ensures occs_batch size matches 2 * alpha.size().
+            // reduce
+            MPI_Reduce(node_sum_occ.data(), avg_occs.data(), occ_size, MPI_DOUBLE, MPI_SUM, 0, leaders_comm);
+            // Compute average occupations by dividing by total number of batches
+            for (size_t i = 0; i < occ_size; ++i)
+                avg_occs[i] /= n_batches;
+            // Convert interleaved [alpha0, beta0, alpha1, beta1, ...] to { alpha[], beta[] }. 
+            // NOTE: assert ensures avg_occs size matches 2 * alpha.size().
             assert(2 * latest_occupancies[0].size() == avg_occs.size());
             for (std::size_t j = 0; j < latest_occupancies[0].size(); ++j)
             {
                 latest_occupancies[0][j] = avg_occs[2 * j];     // alpha orbital
                 latest_occupancies[1][j] = avg_occs[2 * j + 1]; // beta orbital
             }
-
-            /*// again print latest_occupancies for debugging
-            std::cout << "latest_occupancies:\n";
-
-            // Alpha
-            std::cout << "  alpha: [";
-            for (size_t j = 0; j < latest_occupancies[0].size(); ++j) {
-                if (j > 0) std::cout << ", ";
-                std::cout << latest_occupancies[0][j];
-            }
-            std::cout << "]\n";
-
-            // Beta
-            std::cout << "  beta:  [";
-            for (size_t j = 0; j < latest_occupancies[1].size(); ++j) {
-                if (j > 0) std::cout << ", ";
-                std::cout << latest_occupancies[1][j];
-            }
-            std::cout << "]\n";*/
         }
 
-        
-        
+        // (3) Broadcast latest occupations to all ranks for the next recovery iteration
+        MPI_Bcast(latest_occupancies[0].data(), latest_occupancies[0].size(), MPI_DOUBLE, 0, sqd_data.comm);
+        MPI_Bcast(latest_occupancies[1].data(), latest_occupancies[1].size(), MPI_DOUBLE, 0, sqd_data.comm);
+
+        // (4) Each node (through leader) sends its minimum energy to rank 0
+        // global minimum is automatically saved in best_E on rank 0 through MPI_Reduce using MPI_MIN as operation
+        double node_best_E = std::numeric_limits<double>::max();;
+        for (const auto& e : local_energies)
+        {
+            node_best_E = std::min(node_best_E, e);
+        }
+        if (is_node_leader)
+        {
+            MPI_Reduce(&node_best_E, &best_E, 1, MPI_DOUBLE, MPI_MIN, 0, leaders_comm); 
+        }
+    }
+
+    // End time and report elapsed time
+    auto end = std::chrono::high_resolution_clock::now();   // end timer
+    std::chrono::duration<double> elapsed = end - start;
+    if (sqd_data.mpi_rank == 0)
+    {
+        std::cout << "Best energy: " << best_E << std::endl;
+        std::cout << "\nTotal SQD-HPC elapsed time: " << elapsed.count() << " seconds" << std::endl;
     }
 
     // Synchronize and tear down MPI. No MPI calls are allowed beyond this point.
     MPI_Finalize();
 
     return 0;
+        
 }
