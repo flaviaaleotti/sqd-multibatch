@@ -393,8 +393,8 @@ int main(int argc, char* argv[])
 
         // get backend from Quantum Runtime Service
         // set 2 environment variables before executing
-        // QISKIT_IBM_TOKEN = "your API key"
-        // QISKIT_IBM_INSTANCE = "your CRN"
+        // QISKIT_IBM_TOKEN = "DKIsnszrmynDz4rKv-LKb7D1wHvaCGi8v_4kApH4VJ_7"
+        // QISKIT_IBM_INSTANCE = "crn:v1:bluemix:public:project:eu-de:a/138587e255dc43c2809f2c0f4bb97a1c:55f32ad2-0d82-4e1c-9e86-49936b4167bf::"
         std::string backend_name = sqd_data.backend_name;
         auto service = QiskitRuntimeService();
         auto backend = service.backend(backend_name);
@@ -810,7 +810,10 @@ int main(int argc, char* argv[])
         }
 
         // ===== COLLECT AND POST-PROCESS RESULTS =====
-
+    
+        // place an MPI_Barrier here to synchronize all ranks before postprocessing
+        //MPI_Barrier(leaders_comm);
+        
         double start_postprocess = MPI_Wtime();
         
         // (1) compute sum of occupations across all batches on this node (stored in node_sum_occ)
@@ -827,40 +830,64 @@ int main(int argc, char* argv[])
         {
             // reduce
             MPI_Reduce(node_sum_occ.data(), avg_occs.data(), occ_size, MPI_DOUBLE, MPI_SUM, 0, leaders_comm);
-            // Compute average occupations by dividing by total number of batches
+            //// Compute average occupations by dividing by total number of batches
+            //for (size_t i = 0; i < occ_size; ++i)
+            //    avg_occs[i] /= n_batches;
+            //// Convert interleaved [alpha0, beta0, alpha1, beta1, ...] to { alpha[], beta[] }. 
+            //// NOTE: assert ensures avg_occs size matches 2 * alpha.size().
+            //assert(2 * latest_occupancies[0].size() == avg_occs.size());
+            //for (std::size_t j = 0; j < latest_occupancies[0].size(); ++j)
+            //{
+            //    latest_occupancies[0][j] = avg_occs[2 * j];     // alpha orbital
+            //    latest_occupancies[1][j] = avg_occs[2 * j + 1]; // beta orbital
+            //}
+        }
+        // compute average on global root
+        if (is_node_leader && leaders_rank == 0) {
             for (size_t i = 0; i < occ_size; ++i)
                 avg_occs[i] /= n_batches;
-            // Convert interleaved [alpha0, beta0, alpha1, beta1, ...] to { alpha[], beta[] }. 
-            // NOTE: assert ensures avg_occs size matches 2 * alpha.size().
-            assert(2 * latest_occupancies[0].size() == avg_occs.size());
-            for (std::size_t j = 0; j < latest_occupancies[0].size(); ++j)
-            {
-                latest_occupancies[0][j] = avg_occs[2 * j];     // alpha orbital
-                latest_occupancies[1][j] = avg_occs[2 * j + 1]; // beta orbital
-            }
+        }
+        if (is_node_leader){
+            // Step 3a: Broadcast to all node leaders
+            MPI_Bcast(avg_occs.data(), occ_size, MPI_DOUBLE, 0, leaders_comm);
+        }
+        
+        // Step 3b: Each leader broadcasts to its local ranks
+        MPI_Bcast(avg_occs.data(), occ_size, MPI_DOUBLE, 0, node_comm);
+        
+        // Step 3c: Convert to latest_occupancies on all ranks
+        for (std::size_t j = 0; j < latest_occupancies[0].size(); ++j) {
+            latest_occupancies[0][j] = avg_occs[2*j];
+            latest_occupancies[1][j] = avg_occs[2*j+1];
         }
 
-        // (3) Broadcast latest occupations to all ranks for the next recovery iteration
-        MPI_Bcast(latest_occupancies[0].data(), latest_occupancies[0].size(), MPI_DOUBLE, 0, sqd_data.comm);
-        MPI_Bcast(latest_occupancies[1].data(), latest_occupancies[1].size(), MPI_DOUBLE, 0, sqd_data.comm);
+        //// (3) Broadcast latest occupations to all ranks for the next recovery iteration
+        //MPI_Bcast(latest_occupancies[0].data(), latest_occupancies[0].size(), MPI_DOUBLE, 0, sqd_data.comm);
+        //MPI_Bcast(latest_occupancies[1].data(), latest_occupancies[1].size(), MPI_DOUBLE, 0, sqd_data.comm);
 
         // (4) Each node (through leader) sends its minimum energy to rank 0
         // global minimum is automatically saved in best_E on rank 0 through MPI_Reduce using MPI_MIN as operation
-        double node_best_E = std::numeric_limits<double>::max();;
-        for (const auto& e : local_energies)
-        {
-            node_best_E = std::min(node_best_E, e);
-        }
-        if (is_node_leader)
-        {
-            MPI_Reduce(&node_best_E, &best_E, 1, MPI_DOUBLE, MPI_MIN, 0, leaders_comm); 
-        }
+        //double node_best_E = std::numeric_limits<double>::max();;
+        //for (const auto& e : local_energies)
+        //{
+        //    node_best_E = std::min(node_best_E, e);
+        //}
+        //if (is_node_leader)
+        //{
+        //    MPI_Reduce(&node_best_E, &best_E, 1, MPI_DOUBLE, MPI_MIN, 0, leaders_comm); 
+        //}
 
         double end_postprocess = MPI_Wtime();
         if (is_node_leader)
         {
             std::cout << "TIME: collect results and postprocess " << (end_postprocess - start_postprocess) << " seconds" << std::endl;
         }
+        double node_best_E = *std::min_element(local_energies.begin(), local_energies.end());
+        double global_best_E;
+        if (is_node_leader) {
+            MPI_Reduce(&node_best_E, &global_best_E, 1, MPI_DOUBLE, MPI_MIN, 0, leaders_comm);
+        }
+
     }
 
     // End time and report elapsed time
